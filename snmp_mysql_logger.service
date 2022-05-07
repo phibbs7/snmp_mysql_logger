@@ -1,0 +1,26 @@
+[Unit]
+Description=A SNMP host monitoring daemon that logs to a MYSQL database.
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ruby /usr/local/bin/snmp_mysql_logger.rb -c /etc/snmp_mysql_logger/logger.conf
+Restart=on-failure
+# Need to set a specific user as the config file stores passwords.
+User=snmpmysqllogger
+Group=snmpmysqllogger
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictSUIDSGID=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+RemoveIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+
+[Install]
+WantedBy=multi-user.target
+
