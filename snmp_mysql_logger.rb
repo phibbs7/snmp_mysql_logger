@@ -1221,6 +1221,7 @@ end
 
 def snmp_thread_funct(dryRunMode, enableSqlErrors, snmpMutex, db_infoArr, intervalArr)
 	ret = 0
+	dbh = nil
 
 	if snmpMutex.kind_of?(Mutex)
 		# Lock the mutex.
@@ -1250,262 +1251,314 @@ def snmp_thread_funct(dryRunMode, enableSqlErrors, snmpMutex, db_infoArr, interv
 		snmpMutex.unlock
 
 		# Connect to the database.
-		dbh = mysql_connect(db_infoArr[0], db_infoArr[1], db_infoArr[2], db_infoArr[3])
-		if dbh != nil
-			puts "INFO: Created mysql connection for interval thread: #{my_interval}.\n"
+		while dbh == nil
+			dbh = mysql_connect(db_infoArr[0], db_infoArr[1], db_infoArr[2], db_infoArr[3])
+			if dbh == nil
+				puts "INFO: Could not establish mysql connection for interval thread: #{my_interval}. Retrying in 30 seconds.\n"
+				sleep 30
+			end
+		end
 
-			# Check the host array.
-			for i in (0...intervalArr[1][0].length)
-				host = hostArr[i]
-				if host.kind_of?(Array) && host.length > 2 && host[0].length > 0
-					if host[1] == 3
-					# SNMPv3 host.
-						if host.length == 8 && host[2].length > 0
-							# Open manager connection.
-							mgr = NETSNMP::Client.new(host: host[0], username: host[2],
-							auth_password: host[3], auth_protocol: host[4] == "md5" ? :md5 : nil,
-							priv_password: host[5], priv_protocol: host[6] == "des" ? :des : nil,
-							context: host[7])
-							if mgr != nil
-								host << mgr
-								puts "INFO: Created SNMP manager for SNMP host #{host[0]} for interval #{my_interval}.\n"
-							else
-								msg = "WARNING: Discarded a SNMP host #{host[0]} for processing "
-								msg << "on interval #{my_interval}. Connection error.\n"
-								puts msg
-								msg = nil
-								hostArr.delete_at(i)
-							end
-						else
-							puts "WARNING: Discarded a SNMP host #{host[0]} for processing on interval #{my_interval}. Invalid username.\n"
-							hostArr.delete_at(i)
-						end
-					else
-						# SNMPv1 / SNMPv2 host.
-						if host.length == 3 && host[2].length > 0
-							mgr = NETSNMP::Client.new(version: host[1], host: host[0], community: host[2])
-							if mgr != nil
-								host << mgr
-								puts "INFO: Created SNMP manager for SNMP host #{host[0]} for interval #{my_interval}.\n"
-							else
-								msg = "WARNING: Discarded a SNMP host #{host[0]} for processing "
-								msg << "on interval #{my_interval}. Connection error.\n"
-								puts msg
-								msg = nil
-								hostArr.delete_at(i)
-							end
+		puts "INFO: Created mysql connection for interval thread: #{my_interval}.\n"
+
+		# Check the host array.
+		for i in (0...intervalArr[1][0].length)
+			host = hostArr[i]
+			if host.kind_of?(Array) && host.length > 2 && host[0].length > 0
+				if host[1] == 3
+				# SNMPv3 host.
+					if host.length == 8 && host[2].length > 0
+						# Open manager connection.
+						mgr = NETSNMP::Client.new(host: host[0], username: host[2],
+						auth_password: host[3], auth_protocol: host[4] == "md5" ? :md5 : nil,
+						priv_password: host[5], priv_protocol: host[6] == "des" ? :des : nil,
+						context: host[7])
+						if mgr != nil
+							host << mgr
+							puts "INFO: Created SNMP manager for SNMP host #{host[0]} for interval #{my_interval}.\n"
 						else
 							msg = "WARNING: Discarded a SNMP host #{host[0]} for processing "
-							msg << "on interval #{my_interval}. Invalid community.\n"
+							msg << "on interval #{my_interval}. Connection error.\n"
 							puts msg
 							msg = nil
 							hostArr.delete_at(i)
 						end
+					else
+						puts "WARNING: Discarded a SNMP host #{host[0]} for processing on interval #{my_interval}. Invalid username.\n"
+						hostArr.delete_at(i)
 					end
 				else
-					# Invalid host entry. Discard for processing loop.
-					msg = "WARNING: Discarded a SNMP host ( "
-					msg << (host[0].length > 0) ? "#{host[0]}" : "INVALID HOSTNAME" << " ) for processing "
-					msg << "on interval #{my_interval}.\n"
-					puts msg
-					msg = nil
-					hostArr.delete_at(i)
-				end
-				host = nil
-			end
-
-			# Check the snmp_valsArr.
-			for i in (0...snmp_valsArr.length)
-				if snmp_valsArr[i].kind_of?(Array) && snmp_valsArr[i].length == 2 && snmp_valsArr[i][0].length <= 0
-					# Invalid snmp value id. Discard for processing loop.
-					puts "WARNING: Discarded a SNMP value ID for processing on interval #{my_interval}.\n"
-					snmp_valsArr.delete_at(i)
-				end
-			end
-
-			# If we still have anything to process...
-			if hostArr.length > 0 && snmp_valsArr.length > 0
-				# Set the exit flag.
-				Thread.current.thread_variable_set("my_exit", false)
-
-				# Begin host process loop.
-				while (!Thread.current.thread_variable_get("my_exit"))
-					begin
-						# Start the host process loop.
-						for host in hostArr
-							# Set up the initial queries.
-							dyn_query = "INSERT INTO #{DB_TBL_NAME_SNMP_VALUES_DYNAMIC}"
-							static_ins_query = "INSERT INTO #{DB_TBL_NAME_SNMP_VALUES_STATIC}"
-							gen_query = "(#{DB_SNMP_VALUES_FK_HOSTID}, "
-							gen_query << "#{DB_SNMP_VALUES_FK_VALUEID}, #{DB_SNMP_VALUES_COL_ENTRY_VALUE}) VALUES ( "
-							gen_query << "(SELECT #{DB_VALUE_PK_NAME} FROM #{DB_TBL_NAME_HOSTS} "
-							gen_query << "WHERE #{DB_HOSTS_COL_HOSTNAME}='"
-							gen_query << host[0] << "'), "
-							gen_query << "(SELECT #{DB_VALUE_PK_NAME} FROM #{DB_TBL_NAME_SNMP_VALUE_IDS} "
-							gen_query << "WHERE #{DB_SNMP_VALUE_IDS_COL_ENTRY_NAME}='"
-							dyn_query << gen_query
-							static_ins_query << gen_query
-							gen_query = nil
-
-							# Static update query.
-							static_upd0_query = "UPDATE #{DB_TBL_NAME_SNMP_VALUES_STATIC} SET #{DB_SNMP_VALUES_COL_ENTRY_TIME}=NOW(), "
-							static_upd0_query << "#{DB_SNMP_VALUES_COL_ENTRY_VALUE}='"
-							static_upd1_query = "' WHERE #{DB_SNMP_VALUES_FK_HOSTID}="
-							static_upd1_query << "(SELECT #{DB_VALUE_PK_NAME} FROM #{DB_TBL_NAME_HOSTS} "
-							static_upd1_query << "WHERE #{DB_HOSTS_COL_HOSTNAME}='"
-							static_upd1_query << host[0] << "') AND #{DB_SNMP_VALUES_FK_VALUEID}=(SELECT #{DB_VALUE_PK_NAME} "
-							static_upd1_query << "FROM #{DB_TBL_NAME_SNMP_VALUE_IDS} WHERE #{DB_SNMP_VALUE_IDS_COL_ENTRY_NAME}='"
-							static_upd2_query = "') "
-
-							# Start the val process loop.
-							for vals in snmp_valsArr
-								snmp_result = nil
-								val = vals[0]
-
-								# Guard against fail.
-								begin
-									# Obtain mutex lock.
-									snmpMutex.synchronize do
-										# Query the snmp host.
-										temp_result = host[(host[1] == 3 ? 8 : 3)].get(oid: val)
-										snmp_result = temp_result.clone
-										temp_result = nil
-									end
-
-								rescue Exception => e
-									snmp_result = nil
-									if dryRunMode
-										msg = "ERROR: Unable to query SNMP host ( #{host[0]} ) on interval #{my_interval} "
-										msg << "for OID: ( #{val} ) "
-										msg << "Exception Raised: #{e}\n"
-										puts msg
-										msg = nil
-									end
-								end
-
-								# Check for valid data.
-								if snmp_result != nil
-									# Construct the needed query data.
-									sr = String.new
-									if vals[1] == true
-										# Static value.
-										sr << static_upd0_query << dbh.escape(snmp_result.to_s)
-										sr << static_upd1_query << val << static_upd2_query
-									else
-										# Dynamic value.
-										sr << dyn_query
-										sr << val << "'), "
-										sr << "'" << dbh.escape(snmp_result.to_s) << "' ) "
-									end
-
-									# Insert the data into the database.
-									if dryRunMode
-										msg = "INFO: DRY RUN mode enabled. On interval #{my_interval}. "
-										msg << "Database Query that would "
-										msg << "have been executed is printed below:\nINFO: #{sr}\n"
-										puts msg
-										msg = nil
-									else
-										# Guard against fail.
-										begin
-											if enableSqlErrors
-												puts "INFO: Database Query on interval #{my_interval}: #{sr}\n"
-											end
-
-											# Actually do it.
-											dbh.query(sr)
-											if dbh.affected_rows == 0
-												msg = "ERROR: Unable to insert / update value "
-												msg << "into database. DBMS did nothing with "
-												msg << "the query on interval #{my_interval}.\n"
-
-												if vals[1] == true && sr[0, 6] == "UPDATE"
-													sr = nil
-													sr = String.new
-													sr << static_ins_query << val << "'), "
-													sr << "'" << dbh.escape(snmp_result.to_s) << "' ) "
-													if enableSqlErrors
-														msi = "INFO: Database Query on interval "
-														msi << "#{my_interval}: "
-														msi << " #{sr}\n"
-														puts msi
-														msi = nil
-													end
-													dbh.query(sr)
-													if dbh.affected_rows == 0 && enableSqlErrors
-														puts msg
-													end
-												else
-													if enableSqlErrors
-														puts msg
-													end
-												end
-												msg = nil
-											end
-										rescue Exception => e
-											sr = nil
-											if enableSqlErrors
-												msg = "ERROR: Unable to insert / update value into database "
-												msg << "on interval #{my_interval}. Exception Raised: #{e}\n"
-												puts msg
-												msg = nil
-											end
-										end
-									end
-
-									# Reset sr and snmp_result.
-									sr = nil
-									snmp_result = nil
-								end
-
-								# Reset val.
-								val = nil
-							end # End the val process loop.
-
-							# Reset queries.
-							dyn_query = nil
-							static_ins_query = nil
-							static_upd0_query = nil
-							static_upd1_query = nil
-							static_upd2_query = nil
-
-						end # End the host process loop.
-
-						# Wait for interval. (Default is 10 secs.)
-						sleep (my_interval != nil && my_interval.to_i > 0) ? my_interval : 10
-					rescue Exception => e
-						if e.kind_of?(SystemExit)
-							Thread.current.thread_variable_set("my_exit", true)
+					# SNMPv1 / SNMPv2 host.
+					if host.length == 3 && host[2].length > 0
+						mgr = NETSNMP::Client.new(version: host[1], host: host[0], community: host[2])
+						if mgr != nil
+							host << mgr
+							puts "INFO: Created SNMP manager for SNMP host #{host[0]} for interval #{my_interval}.\n"
 						else
-							# Non-standard exit.
-							puts "ERROR: Terminating thread for interval #{my_interval} due to Exception Raised: #{e}\n"
-							ret = -3
-							break
+							msg = "WARNING: Discarded a SNMP host #{host[0]} for processing "
+							msg << "on interval #{my_interval}. Connection error.\n"
+							puts msg
+							msg = nil
+							hostArr.delete_at(i)
 						end
+					else
+						msg = "WARNING: Discarded a SNMP host #{host[0]} for processing "
+						msg << "on interval #{my_interval}. Invalid community.\n"
+						puts msg
+						msg = nil
+						hostArr.delete_at(i)
 					end
 				end
 			else
-				puts "ERROR: Interval #{my_interval} nothing to do on this thread, terminating thread.\n"
-				ret = -2
+				# Invalid host entry. Discard for processing loop.
+				msg = "WARNING: Discarded a SNMP host ( "
+				msg << (host[0].length > 0) ? "#{host[0]}" : "INVALID HOSTNAME" << " ) for processing "
+				msg << "on interval #{my_interval}.\n"
+				puts msg
+				msg = nil
+				hostArr.delete_at(i)
 			end
-
-			# Close the snmp managers.
-			for host in hostArr
-				if host[3] == 3
-					host[8].close
-				else
-					host[3].close
-				end
-				puts "INFO: Closed SNMP manager for #{host[0]} for interval #{my_interval}.\n"
-			end
-
-			# Close the connection to the database server.
-			mysql_close(dbh)
-			puts "INFO: Closed mysql connection for interval #{my_interval}.\n"
-		else
-			puts "ERROR: Could not open mysql connection to #{db_infoArr[0]}/#{db_infoArr[3]} with the given credentials for interval #{my_interval}.\n"
-			ret = -1
+			host = nil
 		end
+
+		# Check the snmp_valsArr.
+		for i in (0...snmp_valsArr.length)
+			if snmp_valsArr[i].kind_of?(Array) && snmp_valsArr[i].length == 2 && snmp_valsArr[i][0].length <= 0
+				# Invalid snmp value id. Discard for processing loop.
+				puts "WARNING: Discarded a SNMP value ID for processing on interval #{my_interval}.\n"
+				snmp_valsArr.delete_at(i)
+			end
+		end
+
+		# If we still have anything to process...
+		if hostArr.length > 0 && snmp_valsArr.length > 0
+			# Set the exit flag.
+			Thread.current.thread_variable_set("my_exit", false)
+
+			# Set the conn_recovery flag.
+			Thread.current.thread_variable_set("my_conn_recovery", false)
+
+			# Begin host process loop.
+			while (!Thread.current.thread_variable_get("my_exit"))
+				begin
+					if (Thread.current.thread_variable_get("my_conn_recovery"))
+						puts "INFO: mysql connection failure for interval thread: #{my_interval}. Attempting to recover.\n"
+
+						# Close the connection to the database server.
+						if dbh != nil
+							mysql_close(dbh)
+							dbh = nil
+						end
+
+						# Begin connection recovery loop.
+						while ((!Thread.current.thread_variable_get("my_exit")) && (dbh == nil))
+							# Attempt to reconnect to the database server.
+							dbh = mysql_connect(db_infoArr[0], db_infoArr[1], db_infoArr[2], db_infoArr[3])
+							if dbh != nil
+								puts "INFO: Recovered mysql connection for interval thread: #{my_interval}.\n"
+
+								# Clear the connection recovery flag.
+								Thread.current.thread_variable_set("my_conn_recovery", false)
+							else
+								# Wait for the process interval before trying again.
+								# (Or 30 seconds whichever wait is shorter.)
+								sleep (my_interval != nil && my_interval.to_i > 0) ? my_interval : 30
+							end
+						end
+					end
+
+			        # Begin the connection loop.
+			        while (!Thread.current.thread_variable_get("my_exit") &&
+			                !Thread.current.thread_variable_get("my_conn_recovery"))
+				        begin
+					        # Start the host process loop.
+					        for host in hostArr
+						        # Set up the initial queries.
+						        dyn_query = "INSERT INTO #{DB_TBL_NAME_SNMP_VALUES_DYNAMIC}"
+						        static_ins_query = "INSERT INTO #{DB_TBL_NAME_SNMP_VALUES_STATIC}"
+						        gen_query = "(#{DB_SNMP_VALUES_FK_HOSTID}, "
+						        gen_query << "#{DB_SNMP_VALUES_FK_VALUEID}, #{DB_SNMP_VALUES_COL_ENTRY_VALUE}) VALUES ( "
+						        gen_query << "(SELECT #{DB_VALUE_PK_NAME} FROM #{DB_TBL_NAME_HOSTS} "
+						        gen_query << "WHERE #{DB_HOSTS_COL_HOSTNAME}='"
+						        gen_query << host[0] << "'), "
+						        gen_query << "(SELECT #{DB_VALUE_PK_NAME} FROM #{DB_TBL_NAME_SNMP_VALUE_IDS} "
+						        gen_query << "WHERE #{DB_SNMP_VALUE_IDS_COL_ENTRY_NAME}='"
+						        dyn_query << gen_query
+						        static_ins_query << gen_query
+						        gen_query = nil
+
+						        # Static update query.
+						        static_upd0_query = "UPDATE #{DB_TBL_NAME_SNMP_VALUES_STATIC} SET #{DB_SNMP_VALUES_COL_ENTRY_TIME}=NOW(), "
+						        static_upd0_query << "#{DB_SNMP_VALUES_COL_ENTRY_VALUE}='"
+						        static_upd1_query = "' WHERE #{DB_SNMP_VALUES_FK_HOSTID}="
+						        static_upd1_query << "(SELECT #{DB_VALUE_PK_NAME} FROM #{DB_TBL_NAME_HOSTS} "
+						        static_upd1_query << "WHERE #{DB_HOSTS_COL_HOSTNAME}='"
+						        static_upd1_query << host[0] << "') AND #{DB_SNMP_VALUES_FK_VALUEID}=(SELECT #{DB_VALUE_PK_NAME} "
+						        static_upd1_query << "FROM #{DB_TBL_NAME_SNMP_VALUE_IDS} WHERE #{DB_SNMP_VALUE_IDS_COL_ENTRY_NAME}='"
+						        static_upd2_query = "') "
+
+						        # Start the val process loop.
+						        for vals in snmp_valsArr
+							        snmp_result = nil
+							        val = vals[0]
+
+							        # Guard against fail.
+							        begin
+								        # Obtain mutex lock.
+								        snmpMutex.synchronize do
+									        # Query the snmp host.
+									        temp_result = host[(host[1] == 3 ? 8 : 3)].get(oid: val)
+									        snmp_result = temp_result.clone
+									        temp_result = nil
+								        end
+
+							        rescue Exception => e
+								        snmp_result = nil
+								        if dryRunMode
+									        msg = "ERROR: Unable to query SNMP host ( #{host[0]} ) on interval #{my_interval} "
+									        msg << "for OID: ( #{val} ) "
+									        msg << "Exception Raised: #{e}\n"
+									        puts msg
+									        msg = nil
+								        end
+							        end
+
+							        # Check for valid data.
+							        if snmp_result != nil
+								        # Construct the needed query data.
+								        sr = String.new
+								        if vals[1] == true
+									        # Static value.
+									        sr << static_upd0_query << dbh.escape(snmp_result.to_s)
+									        sr << static_upd1_query << val << static_upd2_query
+								        else
+									        # Dynamic value.
+									        sr << dyn_query
+									        sr << val << "'), "
+									        sr << "'" << dbh.escape(snmp_result.to_s) << "' ) "
+								        end
+
+								        # Insert the data into the database.
+								        if dryRunMode
+									        msg = "INFO: DRY RUN mode enabled. On interval #{my_interval}. "
+									        msg << "Database Query that would "
+									        msg << "have been executed is printed below:\nINFO: #{sr}\n"
+									        puts msg
+									        msg = nil
+								        else
+									        # Guard against fail.
+									        begin
+										        if enableSqlErrors
+											        puts "INFO: Database Query on interval #{my_interval}: #{sr}\n"
+										        end
+
+										        # Actually do it.
+										        dbh.query(sr)
+										        if dbh.affected_rows == 0
+											        msg = "ERROR: Unable to insert / update value "
+											        msg << "into database. DBMS did nothing with "
+											        msg << "the query on interval #{my_interval}.\n"
+
+											        if vals[1] == true && sr[0, 6] == "UPDATE"
+												        sr = nil
+												        sr = String.new
+												        sr << static_ins_query << val << "'), "
+												        sr << "'" << dbh.escape(snmp_result.to_s) << "' ) "
+												        if enableSqlErrors
+													        msi = "INFO: Database Query on interval "
+													        msi << "#{my_interval}: "
+													        msi << " #{sr}\n"
+													        puts msi
+													        msi = nil
+												        end
+												        dbh.query(sr)
+												        if dbh.affected_rows == 0 && enableSqlErrors
+													        puts msg
+												        end
+											        else
+												        if enableSqlErrors
+													        puts msg
+												        end
+											        end
+											        msg = nil
+										        end
+									        rescue Exception => e
+										        sr = nil
+										        if enableSqlErrors
+											        msg = "ERROR: Unable to insert / update value into database "
+											        msg << "on interval #{my_interval}. Exception Raised: #{e}\n"
+											        puts msg
+											        msg = nil
+										        end
+										        Thread.current.thread_variable_set("my_conn_recovery", true)
+										        break
+									        end
+								        end
+
+								        # Reset sr and snmp_result.
+								        sr = nil
+								        snmp_result = nil
+							        end
+
+							        # Reset val.
+							        val = nil
+						        end # End the val process loop.
+
+						        # Reset queries.
+						        dyn_query = nil
+						        static_ins_query = nil
+						        static_upd0_query = nil
+						        static_upd1_query = nil
+						        static_upd2_query = nil
+
+							# Check for mysql connection failure.
+							if (Thread.current.thread_variable_get("my_conn_recovery"))
+								break
+							end
+					        end # End the host process loop.
+
+					        # Wait for interval. (Default is 10 secs.)
+					        sleep (my_interval != nil && my_interval.to_i > 0) ? my_interval : 10
+				        rescue Exception => e
+					        if e.kind_of?(SystemExit)
+						        Thread.current.thread_variable_set("my_exit", true)
+					        else
+						        # Non-standard exit.
+						        puts "ERROR: Terminating thread for interval #{my_interval} due to Exception Raised: #{e}\n"
+						        ret = -3
+						        break
+					        end
+				        end
+				    end
+				rescue Exception => e
+					if e.kind_of?(SystemExit)
+						Thread.current.thread_variable_set("my_exit", true)
+					else
+						# Non-standard exit.
+						puts "ERROR: Terminating thread for interval #{my_interval} due to Exception Raised: #{e}\n"
+						ret = -3
+						Thread.current.thread_variable_set("my_exit", true)
+					end
+				end
+			end
+		else
+			puts "ERROR: Interval #{my_interval} nothing to do on this thread, terminating thread.\n"
+			ret = -2
+		end
+
+		# Close the snmp managers.
+		for host in hostArr
+			if host[3] == 3
+				host[8].close
+			else
+				host[3].close
+			end
+			puts "INFO: Closed SNMP manager for #{host[0]} for interval #{my_interval}.\n"
+		end
+
+		# Close the connection to the database server.
+		mysql_close(dbh)
+		puts "INFO: Closed mysql connection for interval #{my_interval}.\n"
 		puts "INFO: Exiting thread for interval #{my_interval}.\n"
 	end
 	return ret
@@ -1520,6 +1573,8 @@ test("Hwloe")
 # Begin "main" function below.
 retArr = nil
 ret = 0
+dbh = nil
+
 if $my_generate_conf_file
 	gen_config_file($my_config_file)
 else
@@ -1531,7 +1586,21 @@ if retArr.kind_of?(Array) && retArr.length > 3 && retArr[0] == 1 && retArr[3].ki
 	# 0: retVal, 1: hosts Arr, 2: snmp_vars Arr, 3: database info Arr.
 
 	# Open mysql connection to the database server.
-	dbh = mysql_connect(retArr[3][0], retArr[3][1], retArr[3][2], retArr[3][3])
+	if $my_dry_run
+		# Dry run, only make one attempt.
+		dbh = mysql_connect(retArr[3][0], retArr[3][1], retArr[3][2], retArr[3][3])
+	else
+		# Regular mode, try until we succeed.
+		while dbh == nil
+			dbh = mysql_connect(retArr[3][0], retArr[3][1], retArr[3][2], retArr[3][3])
+			if dbh == nil
+				puts "INFO: Could not establish mysql connection, will retry in 30 seconds.\n"
+				# Sleep for 30 seconds between attempts.
+				sleep 30
+			end
+		end
+	end
+
 	if dbh != nil
 
 		if $my_create_tables || $my_force_table_creation
